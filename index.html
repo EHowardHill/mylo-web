@@ -155,11 +155,130 @@
       getPollVoters: (postId, optionId) => request(`/posts/${postId}/poll/voters/${optionId}`),
       getNotifications: () => request('/notifications'),
       markNotificationsRead: () => request('/notifications/read', { method: 'POST' }),
+      getPushVapidKey: () => request('/push/vapid-key'),
+      pushSubscribe: (body) => request('/push/subscribe', { method: 'POST', body }),
+      pushUnsubscribe: (endpoint) => request('/push/unsubscribe', { method: 'POST', body: { endpoint } }),
+      getPushStatus: () => request('/push/status'),
+      sendTestPush: () => request('/push/test', { method: 'POST' }),
+      saveFcmToken: (token, platform) => request('/push/fcm/token', { method: 'POST', body: { token, platform } }),
+      removeFcmToken: (token) => request('/push/fcm/token/remove', { method: 'POST', body: { token } }),
       getConversations: () => request('/dm/conversations'),
       startDM: (uid) => request(`/dm/conversations/${uid}`, { method: 'POST' }),
       gifTrending: () => request('/gif/trending'),
       gifSearch: (q) => request(`/gif/search?q=${encodeURIComponent(q)}`),
     };
+
+    /* ============================ PUSH NOTIFICATIONS ============================ */
+    let swRegistration = null;
+
+    const pushSupported = () =>
+      typeof navigator !== 'undefined' &&
+      'serviceWorker' in navigator &&
+      'PushManager' in window &&
+      typeof Notification !== 'undefined';
+
+    function urlBase64ToUint8Array(base64String) {
+      const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+      const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+      const raw = atob(base64);
+      const arr = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+      return arr;
+    }
+
+    const tellSw = (type, contextId) => {
+      try {
+        const sw = (swRegistration && swRegistration.active) ||
+          (navigator.serviceWorker && navigator.serviceWorker.controller);
+        if (sw) sw.postMessage({ type, contextId: String(contextId) });
+      } catch (e) { /* ignore */ }
+    };
+
+    async function ensureServiceWorker() {
+      if (!('serviceWorker' in navigator)) return null;
+      try {
+        swRegistration = await navigator.serviceWorker.register('sw.js', { scope: './' });
+        return swRegistration;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function subscribePush() {
+      if (!pushSupported()) return { ok: false, reason: 'unsupported' };
+      const reg = await ensureServiceWorker();
+      if (!reg) return { ok: false, reason: 'sw-failed' };
+      if (Notification.permission === 'denied') return { ok: false, reason: 'denied' };
+      const { public_key } = await api.getPushVapidKey();
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(public_key),
+        });
+      }
+      await api.pushSubscribe({
+        subscription: sub.toJSON(),
+        platform: 'web',
+        user_agent: navigator.userAgent,
+      });
+      return { ok: true };
+    }
+
+    async function enablePush() {
+      if (!pushSupported()) return { ok: false, reason: 'unsupported' };
+      if (Notification.permission === 'default') {
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') return { ok: false, reason: perm };
+      } else if (Notification.permission !== 'granted') {
+        return { ok: false, reason: Notification.permission };
+      }
+      return subscribePush();
+    }
+
+    async function disablePush() {
+      if (!pushSupported()) return;
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) {
+          const sub = await reg.pushManager.getSubscription();
+          if (sub) {
+            try { await api.pushUnsubscribe(sub.endpoint); } catch (e) { /* ignore */ }
+            await sub.unsubscribe();
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    async function refreshPushOnLogin() {
+      if (!pushSupported() || Notification.permission !== 'granted') return;
+      try { await subscribePush(); } catch (e) { /* ignore */ }
+    }
+
+    async function handlePushDeepLink(ui, toast, onProfileClick) {
+      const params = new URLSearchParams(window.location.search);
+      const tt = params.get('ntt');
+      const tid = params.get('ntid');
+      const cid = params.get('ncid');
+      const sh = params.get('nsh');
+      if (!tt && !sh) return;
+      try { window.history.replaceState({}, document.title, window.location.pathname); } catch (e) { }
+      if (tt === 'post' && tid) {
+        try {
+          const res = await api.getPublicPost(tid);
+          ui.openModal({
+            title: 'post', wide: true, render: (close) => (
+              <Post post={res.post}
+                onProfileClick={(h) => { close(); onProfileClick(h); }}
+                onUpdate={() => { }} onDeleted={() => { }} />
+            ),
+          });
+          return;
+        } catch (e) { toast.show('This post is no longer available.'); return; }
+      }
+      if (tt === 'channel' && cid && tid) { ui.goCircle(cid, tid); return; }
+      if (sh) { ui.goProfile(sh); return; }
+    }
 
     const MatIcon = ({ name, size = 24 }) => (
       <span className="material-symbols-outlined" style={{ fontSize: size, width: size, height: size }}>
@@ -1388,6 +1507,49 @@
        whatever your backend actually sends.
        ================================================================ */
 
+    async function openNotificationNav(n, ui, toast, onProfileClick) {
+      const targetType = n.target_type;
+      const targetId = n.target_id;
+
+      if (targetType === 'post' && targetId) {
+        try {
+          const res = await api.getPublicPost(targetId);
+          ui.openModal({
+            title: 'post', wide: true, render: (close) => (
+              <Post post={res.post}
+                onProfileClick={(h) => { close(); onProfileClick(h); }}
+                onUpdate={() => { }} onDeleted={() => { }} />
+            ),
+          });
+          return true;
+        } catch (e) {
+          toast.show('This post is no longer available.');
+          return false;
+        }
+      }
+
+      if (targetType === 'channel' && targetId && n.circle_id) {
+        ui.goCircle(n.circle_id, targetId);
+        return true;
+      }
+
+      const handle = (n.source_user && n.source_user.handle) || n.source_handle;
+      if (handle) {
+        onProfileClick(handle);
+        return true;
+      }
+
+      const link = n.link || n.href;
+      if (link) {
+        if (/^https?:\/\//.test(link)) window.open(link, '_blank', 'noopener');
+        else window.location.href = link;
+        return true;
+      }
+
+      toast.show('Nothing to open for this notification.');
+      return false;
+    }
+
     const Notifications = ({ onProfileClick }) => {
       const ui = useUI();
       const toast = useToast();
@@ -1411,82 +1573,10 @@
         })();
       }, [toast]);
 
-      // Probe a notification object for the first present field.
-      // Checks top level, then a nested `data`/`meta` payload if present.
-      const pick = (n, keys) => {
-        for (const k of keys) {
-          if (n[k] !== undefined && n[k] !== null) return n[k];
-          if (n.data && n.data[k] !== undefined && n.data[k] !== null) return n.data[k];
-          if (n.meta && n.meta[k] !== undefined && n.meta[k] !== null) return n.meta[k];
-        }
-        return null;
-      };
-
-      const openPostModal = async (postId) => {
-        try {
-          const res = await api.getPublicPost(postId);
-          ui.openModal({
-            title: 'post',
-            wide: true,
-            render: (close) => (
-              <Post
-                post={res.post}
-                onProfileClick={(h) => { close(); onProfileClick(h); }}
-                onUpdate={(np) => { setItems(prev => prev.map(x => x.id === np.id ? np : x)); }}
-                onDeleted={(id) => { setItems(prev => prev.filter(x => x.id !== id)); }}
-              />
-            ),
-          });
-          return true;
-        } catch (e) {
-          return false; // post deleted or endpoint mismatch — fall through
-        }
-      };
-
       const openNotification = async (n) => {
         // Visually mark this one as read immediately
         setItems(prev => prev.map(x => x.id === n.id ? { ...x, is_read: true } : x));
-
-        const targetType = n.target_type;
-        const targetId = n.target_id;
-
-        // ---- 1. Post notifications (mentions, +1s, comments, reshares) ----
-        if (targetType === 'post' && targetId) {
-          if (await openPostModal(targetId)) return;
-          toast.show('This post is no longer available.');
-          return;
-        }
-
-        // ---- 2. Channel / chat notifications (messages, replies, mentions) ----
-        if (targetType === 'channel' && targetId) {
-          if (n.circle_id) {
-            ui.goCircle(n.circle_id, targetId);
-            return;
-          }
-          // No circle resolved — fall through to source user.
-        }
-
-        // ---- 3. Follow notifications: the source IS the follower's profile ----
-        if (targetType === 'profile' && targetId && n.source_user && n.source_user.handle) {
-          onProfileClick(n.source_user.handle);
-          return;
-        }
-
-        // ---- 4. Explicit link from the backend ----
-        const link = pick(n, ['link', 'url', 'href']);
-        if (link) {
-          if (/^https?:\/\//.test(link)) window.open(link, '_blank', 'noopener');
-          else window.location.href = link;
-          return;
-        }
-
-        // ---- 5. Last resort: source user profile ----
-        if (n.source_user && n.source_user.handle) {
-          onProfileClick(n.source_user.handle);
-          return;
-        }
-
-        toast.show('Nothing to open for this notification.');
+        await openNotificationNav(n, ui, toast, onProfileClick);
       };
 
       if (loading) return <Spinner />;
@@ -2253,6 +2343,12 @@
 
       useEffect(() => { load(); }, [load]);
 
+      useEffect(() => {
+        const cid = activeCh ? activeCh.id : null;
+        if (cid) tellSw('context-focus', cid);
+        return () => { if (cid) tellSw('context-blur', cid); };
+      }, [activeCh ? activeCh.id : null]);
+
       const selectCh = (ch) => {
         setActiveCh(ch); setRailOpen(false);
         setUnread(u => ({ ...u, [ch.id]: { ...(u[ch.id] || {}), has_unread: false } }));
@@ -2479,6 +2575,12 @@
         return () => { active = false; };
       }, [circleId]);
 
+      useEffect(() => {
+        const cid = channel ? channel.id : null;
+        if (cid) tellSw('context-focus', cid);
+        return () => { if (cid) tellSw('context-blur', cid); };
+      }, [channel ? channel.id : null]);
+
       if (loading) return <div className="dm-layout"><div className="chat-main"><Spinner /></div></div>;
       if (!channel) return <div className="dm-layout"><div className="chat-main"><div className="chat-header"><button className="icon-btn" onClick={onBack}><I.Back /></button><div className="title">Conversation</div></div><div className="empty-state">This conversation is unavailable.</div></div></div>;
 
@@ -2623,8 +2725,52 @@
       const [bgUrl, setBgUrl] = useState(auth.user.background_url || '');
       const [bgMode, setBgMode] = useState(auth.user.background_mode || 'cover');
       const [bgBlur, setBgBlur] = useState(auth.user.background_blur != null ? auth.user.background_blur : 10);
+      const [pushOn, setPushOn] = useState(false);
+      const [pushBusy, setPushBusy] = useState(false);
       const bgRef = useRef(null);
       const blurTimer = useRef(null);
+
+      useEffect(() => {
+        let alive = true;
+        (async () => {
+          if (!pushSupported() || Notification.permission !== 'granted') return;
+          try {
+            const st = await api.getPushStatus();
+            if (alive) setPushOn((st.subscriptions || 0) > 0);
+          } catch (e) { /* ignore */ }
+        })();
+        return () => { alive = false; };
+      }, []);
+
+      const togglePush = async () => {
+        if (pushBusy) return;
+        setPushBusy(true);
+        try {
+          if (pushOn) {
+            await disablePush();
+            setPushOn(false);
+            toast.show('Push notifications disabled.');
+          } else {
+            const r = await enablePush();
+            if (r.ok) {
+              setPushOn(true);
+              toast.show('Push notifications enabled.');
+            } else if (r.reason === 'denied') {
+              toast.error('Notifications are blocked in your browser settings.');
+            } else if (r.reason === 'unsupported') {
+              toast.error('This browser does not support push notifications.');
+            } else {
+              toast.error('Could not enable push notifications.');
+            }
+          }
+        } catch (e) { toast.error(e.message); }
+        setPushBusy(false);
+      };
+
+      const sendTest = async () => {
+        try { await api.sendTestPush(); toast.show('Test push sent!'); }
+        catch (e) { toast.error(e.message); }
+      };
 
       const applyBackground = (url, mode, blur) => {
         const blurPx = (blur != null ? blur : 10);
@@ -2740,6 +2886,23 @@
                   <span className="user-handle" style={{ minWidth: 28 }}>{bgBlur}px</span>
                 </div>
               </div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-section-title">Notifications</div>
+            <div className="settings-row">
+              <div><div>Push notifications</div><div className="user-handle">Alerts for mentions, replies, comments, and messages</div></div>
+              <button className="btn btn-outline btn-sm" disabled={pushBusy} onClick={togglePush}>{pushBusy ? '…' : (pushOn ? 'Disable' : 'Enable')}</button>
+            </div>
+            {pushOn && (
+              <div className="settings-row">
+                <span>Test it</span>
+                <button className="btn btn-outline btn-sm" onClick={sendTest}>Send test push</button>
+              </div>
+            )}
+            {pushSupported() && Notification.permission === 'denied' && (
+              <div className="settings-row"><span className="user-handle">Blocked — allow notifications for this site in your browser settings.</span></div>
             )}
           </div>
 
@@ -3049,6 +3212,7 @@
       }, [applyBackground]);
 
       const logout = useCallback(async () => {
+        try { await disablePush(); } catch (e) { /* ignore */ }
         try { await api.logout(); } catch (e) { /* ignore */ }
         setUser(null);
         setPage('home');
@@ -3094,6 +3258,16 @@
         return () => clearInterval(iv);
       }, [user, loadBadges]);
 
+      useEffect(() => {
+        if (!user) return;
+        ensureServiceWorker();
+        refreshPushOnLogin();
+        if (pushSupported() && Notification.permission === 'default' && !localStorage.getItem('mylo_push_hint')) {
+          localStorage.setItem('mylo_push_hint', '1');
+          toast.show('Turn on push notifications from Settings.');
+        }
+      }, [user, toast]);
+
       const ui = useMemo(() => ({
         openModal: ({ title, render, wide }) => {
           const id = Date.now() + Math.random();
@@ -3115,6 +3289,30 @@
       }), [loadBadges]);
 
       const goProfileClick = useCallback((h) => ui.goProfile(h), [ui]);
+
+      useEffect(() => {
+        const onSwMessage = (event) => {
+          const msg = event.data || {};
+          if (msg.type === 'PUSH_CLICK' && msg.payload) {
+            openNotificationNav(msg.payload, ui, toast, goProfileClick);
+          }
+        };
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.addEventListener('message', onSwMessage);
+        }
+        return () => {
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.removeEventListener('message', onSwMessage);
+          }
+        };
+      }, [ui, toast, goProfileClick]);
+
+      const didPushDeepLink = useRef(false);
+      useEffect(() => {
+        if (!user || didPushDeepLink.current) return;
+        didPushDeepLink.current = true;
+        handlePushDeepLink(ui, toast, goProfileClick);
+      }, [user, ui, toast, goProfileClick]);
 
       const closeModal = (id) => setModals(m => m.filter(x => x.id !== id));
 
