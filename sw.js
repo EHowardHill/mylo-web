@@ -1,14 +1,86 @@
-/* Mylo service worker — Web Push handler for in-browser notifications */
+/* Mylo service worker — Web Push handler for in-browser notifications
+   + precache of the static shell (API requests are never intercepted). */
 
 const APP_BASE = new URL('./', self.registration.scope).href;
 const LOGO_URL = new URL('mylogo.png', self.registration.scope).href;
 const activeContexts = new Set();
 
-self.addEventListener('install', () => self.skipWaiting());
+/* ============================ STATIC SHELL CACHE ============================ */
+// Bump this whenever index.html / app.js / style.css are redeployed.
+// Must match the ?v= versions used in index.html.
+const CACHE_VERSION = 'v2.0.1';
+const CACHE_NAME = 'mylo-static-' + CACHE_VERSION;
+const PRECACHE = [
+  '',                       // the app shell (index.html)
+  'app.js?v=2.0.1',
+  'style.css?v=1.4.1',
+  'background.webp',
+  'background-lite.webp',
+  'mylogo.png',
+].map((p) => new URL(p, APP_BASE).href);
+
+async function precacheShell() {
+  const cache = await caches.open(CACHE_NAME);
+  await Promise.allSettled(PRECACHE.map((url) => cache.add(url).catch(() => { })));
+}
+
+async function cleanupOldCaches() {
+  const names = await caches.keys();
+  await Promise.all(names.filter((n) => n.startsWith('mylo-static-') && n !== CACHE_NAME).map((n) => caches.delete(n)));
+}
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(precacheShell());
+  self.skipWaiting();
+});
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(Promise.all([cleanupOldCaches(), self.clients.claim()]));
 });
+
+// Cache policy (same-origin only, everything else is an exact passthrough):
+//   - precached static assets  -> cache-first (their URLs are versioned/immutable)
+//   - the app shell navigation -> network-first, cached copy as offline fallback
+//   - everything else (API, uploads, cross-origin) -> untouched, network only.
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  if (new URL(req.url).origin !== self.location.origin) return;
+  const isNavigation = req.mode === 'navigate' && req.url === APP_BASE;
+  const isPrecached = !isNavigation && PRECACHE.includes(req.url);
+  if (!isNavigation && !isPrecached) return;
+
+  if (isNavigation) {
+    event.respondWith((async () => {
+      try {
+        const fresh = await fetch(req);
+        const cache = await caches.open(CACHE_NAME);
+        cache.put(req.url, fresh.clone());
+        return fresh;
+      } catch (e) {
+        const cache = await caches.open(CACHE_NAME);
+        const cached = await cache.match(req.url);
+        return cached || Response.error();
+      }
+    })());
+    return;
+  }
+
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(req.url);
+    if (cached) return cached;
+    try {
+      const fresh = await fetch(req);
+      cache.put(req.url, fresh.clone());
+      return fresh;
+    } catch (e) {
+      return Response.error();
+    }
+  })());
+});
+
+/* ============================ PUSH NOTIFICATIONS ============================ */
 
 self.addEventListener('message', (event) => {
   const msg = event.data || {};
